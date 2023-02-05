@@ -11,15 +11,13 @@ import tensorflow as tf
 
 tf.random.set_seed(25)
 
+
 ALPHABET = [1, 2, 5, 10, 20]
 TRAIN_DIR = "data/train/"
 TEST_DIR = "data/test/"
-ROTATION_ANGLE = 6
-# ROTATION_ANGLE = 18  # 100% 15 epochs
-# ROTATION_ANGLE = 24  # 99.9%
+ROTATION_ANGLE = 8
 IMG_WIDTH = 192
 IMG_HEIGHT = 192
-# 178
 
 
 def load_train_res(file_name):
@@ -27,6 +25,14 @@ def load_train_res(file_name):
     x = d.iloc[:, 0]
     y = d.iloc[:, 1]
     return [[xi, yi] for xi, yi in zip(x, y)]
+
+
+def load_test_res(file_name):
+    d = pd.read_csv(file_name, delimiter=",", engine="python")
+    x = d.iloc[:, 0]
+    y = d.iloc[:, 1]
+    z = d.iloc[:, 2]
+    return [[xi, yi, zi] for xi, yi, zi in zip(x, y, z)]
 
 
 def load_image(path):
@@ -65,6 +71,19 @@ def resize_region(region):
     return cv2.resize(region, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
 
 
+def select_roi(image_orig, image_bin):
+    contours, hierarchy = cv2.findContours(image_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    adequate_contours = [c for i, c in enumerate(contours) if not is_inside_another_contour(c, i, contours)]
+    cropped_images = []
+    for contour in adequate_contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if area > 10000 and (y != x != 0):
+            # cv2.circle(image_orig, (int((x + x + w)/2), int((y + y + h)/2)), int(h/2), (0, 255, 0), 7)
+            cropped_images.append(resize_region(image_orig.copy()[y:y + h, x:x + w]))
+    return cropped_images
+
+
 def select_roi_single(image_orig, image_bin):
     contours, hierarchy = cv2.findContours(image_bin.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     cropped_image = None
@@ -101,6 +120,43 @@ def convert_output(data):
                 output[i] = 1
         nn_outputs.append(output)
     return np.array(nn_outputs)
+
+
+def is_inside_another_contour(contour, index, contours):
+    x, y, w, h = cv2.boundingRect(contour)
+    for i, c in enumerate(contours):
+        if i != index:
+            xc, yc, wc, hc = cv2.boundingRect(c)
+            if x > xc and x + w < xc + wc and y > yc and y + h < yc + hc:
+                return True
+    return False
+
+
+def cut_out_coins(res):
+    coins = { }
+    for (image_name, count, total_sum) in res:
+        filename = TEST_DIR + image_name
+        src = cv2.imread(cv2.samples.findFile(filename), cv2.IMREAD_COLOR)
+
+        alpha = 1.95  # Contrast control (1.0-3.0)
+        beta = 0  # Brightness control (0-100)
+
+        adjusted_image = cv2.convertScaleAbs(src, alpha=alpha, beta=beta)
+
+        gray = cv2.cvtColor(adjusted_image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 5)
+
+        ret, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = np.ones((3, 3), np.uint8)
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        sure_bg = cv2.dilate(opening, kernel, iterations=10)
+
+        cropped_regions = select_roi(src.copy(), cv2.erode(sure_bg, np.ones((7, 7), np.uint8), 5))
+        # display_image(cv2.erode(sure_bg, np.ones((7, 7), np.uint8), 7))
+        # for region in cropped_regions:
+        #     display_image(region)
+        coins[image_name] = cropped_regions
+    return coins
 
 
 def create_model(input_shape, output_size):
@@ -182,6 +238,37 @@ def get_expected_outputs(res):
     return data
 
 
+def evaluate_detection(res, coins):
+    print(">>> DETECTION EVALUATION <<<")
+    number_of_images = len(res)
+    total_absolute_error = 0
+    for (image_name, number_of_coins, total_sum) in res:
+        total_absolute_error += abs(len(coins[image_name]) - number_of_coins)
+        print(image_name + ' - ' + str(number_of_coins) + ' - ' + str(len(coins[image_name])))
+    print("MAE: " + str(total_absolute_error / number_of_images) + "\n")
+
+
+def evaluate_model(model, res, coins):
+    print(">>> MODEL EVALUATION <<<")
+    number_of_images = len(res)
+    total_absolute_error = 0
+    for (image_name, number_of_coins, total_sum) in res:
+        predicted_sum = 0
+        x_test = [scale_to_range(image_gray(image)) for image in coins[image_name]]
+        results = model.predict(np.asarray(x_test, np.float32).reshape(len(x_test), IMG_WIDTH, IMG_HEIGHT, 1), verbose=0)
+        for result in results:
+            predicted_sum += ALPHABET[winner(result)]
+        total_absolute_error += abs(total_sum - predicted_sum)
+        print(image_name + ' - ' + str(total_sum) + ' - ' + str(predicted_sum))
+    print("MAE: " + str(total_absolute_error / number_of_images) + "\n")
+
+
+def evaluate(res, model):
+    coins = cut_out_coins(res)
+    evaluate_detection(res, coins)
+    evaluate_model(model, res, coins)
+
+
 def get_training_data(res):
     print("Preparing data...")
     inputs_raw = load_training_data(res)
@@ -201,22 +288,12 @@ def train(res):
 
 def main():
     train_res = load_train_res(TRAIN_DIR + "res.csv")
-    model = train(train_res)
+    # model = train(train_res)
+    # model.save("./model")
 
-    model.save("./model")
-    # load_model("./model")
-
-    # for i in range(1, 12):
-    #     input_image = load_image("dataProject2/" + str(i) + ".jpg")
-    #     bin_input_image = image_bin(image_gray(input_image))
-    #     selected_regions, numbers = select_roi(input_image.copy(), (dilate(invert(bin_input_image))))
-    #     display_image(bin_input_image)
-    #     display_image(selected_regions)
-    #     inputs = prepare_for_ann(numbers)
-    #     result = model.predict(np.array(inputs, np.float32))
-    #     print(result)
-    #     print("\n")
-    #     print(display_result(result, alphabet))
+    model = load_model("./model")
+    test_res = load_test_res(TEST_DIR + "res.csv")
+    evaluate(test_res, model)
 
 
 if __name__ == "__main__":
